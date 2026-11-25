@@ -1,0 +1,7 @@
+{
+  "name": "antigravity-notifier",
+  "version": "1.0.0",
+  "description": "Desktop notification and alert companion for Google Antigravity on macOS. Alerts when permission, input, or tasks are completed.",
+  "author": "Antigravity Notifier",
+  "hooks": "hooks.json"
+}

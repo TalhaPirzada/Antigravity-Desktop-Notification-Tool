@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for a manual build (for example v1.0.0)"
+        required: false
+        default: "dev"
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Run test suite
+        run: python test_suite.py
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            os: macos-14            # Apple Silicon runner
+            icon: assets/icon.icns
+            archive: tar.gz
+          - target: linux-x86_64
+            os: ubuntu-22.04        # older glibc for wider compatibility
+            icon: assets/icon.png
+            archive: tar.gz
+          - target: windows-x86_64
+            os: windows-latest
+            icon: assets/icon.ico
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.event.inputs.version || 'dev' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build standalone binary
+        shell: bash
+        run: |
+          pyinstaller --onefile --clean --noconfirm \
+            --name agy-notify \
+            --icon "${{ matrix.icon }}" \
+            agy_notify.py
+
+      - name: Assemble release directory
+        shell: bash
+        run: |
+          NAME="agy-notify-${{ steps.version.outputs.value }}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}/assets"
+          cp assets/icon.png assets/icon.icns assets/icon.ico "dist/${NAME}/assets/"
+          cp README.md "dist/${NAME}/"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp dist/agy-notify.exe "dist/${NAME}/"
+          else
+            cp dist/agy-notify "dist/${NAME}/"
+            chmod +x "dist/${NAME}/agy-notify"
+          fi
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            mkdir -p "dist/${NAME}/bin"
+            cp -R "bin/Antigravity Notifier.app" "dist/${NAME}/bin/"
+            codesign --force --deep -s - "dist/${NAME}/bin/Antigravity Notifier.app"
+          fi
+          echo "NAME=${NAME}" >> "$GITHUB_ENV"
+
+      - name: Smoke test packaged binary
+        shell: bash
+        run: |
+          cd "dist/${NAME}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            ./agy-notify.exe --help
+            ./agy-notify.exe doctor || true
+          else
+            ./agy-notify --help
+            ./agy-notify doctor || true
+          fi
+
+      - name: Create archive and checksum
+        shell: bash
+        working-directory: dist
+        run: |
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a -tzip "${NAME}.zip" "${NAME}"
+            ARCHIVE="${NAME}.zip"
+          else
+            tar -czf "${NAME}.tar.gz" "${NAME}"
+            ARCHIVE="${NAME}.tar.gz"
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          fi
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/${{ env.ARCHIVE }}
+            dist/${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -la release-assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
