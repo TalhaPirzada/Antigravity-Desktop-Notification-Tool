@@ -1,58 +1,83 @@
+
 name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*.*.*"
+
   workflow_dispatch:
     inputs:
       version:
-        description: "Version label for a manual build (for example v1.0.0)"
+        description: "Version label for manual builds"
         required: false
-        default: "dev"
+        default: "latest"
 
 permissions:
   contents: read
 
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.14"
 
 jobs:
   test:
-    name: Unit tests
-    runs-on: ubuntu-22.04
+    name: Unit Tests
+    runs-on: ubuntu-26.04.1
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Run test suite
         run: python test_suite.py
+
+      - name: Test Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Unit Tests"
+            echo ""
+            echo "Result: **${{ job.status }}**"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build ${{ matrix.target }}
     needs: test
     runs-on: ${{ matrix.os }}
+
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: macos-arm64
-            os: macos-14            # Apple Silicon runner
+            os: macos-26
             icon: assets/icon.icns
             archive: tar.gz
+
           - target: linux-x86_64
-            os: ubuntu-22.04        # older glibc for wider compatibility
+            os: ubuntu-26.04
             icon: assets/icon.png
             archive: tar.gz
+
           - target: windows-x86_64
-            os: windows-latest
+            os: windows-2025
             icon: assets/icon.ico
             archive: zip
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -61,47 +86,62 @@ jobs:
         shell: bash
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            VERSION="${GITHUB_REF_NAME}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version || 'dev' }}"
           else
-            echo "value=${{ github.event.inputs.version || 'dev' }}" >> "$GITHUB_OUTPUT"
+            VERSION="dev"
           fi
 
-      - name: Install PyInstaller
-        run: python -m pip install --upgrade pip pyinstaller
+          echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
 
       - name: Build standalone binary
         shell: bash
         run: |
-          pyinstaller --onefile --clean --noconfirm \
+          pyinstaller \
+            --onefile \
+            --clean \
+            --noconfirm \
             --name agy-notify \
             --icon "${{ matrix.icon }}" \
             agy_notify.py
 
-      - name: Assemble release directory
+      - name: Assemble package directory
         shell: bash
         run: |
           NAME="agy-notify-${{ steps.version.outputs.value }}-${{ matrix.target }}"
+
           mkdir -p "dist/${NAME}/assets"
+
           cp assets/icon.png assets/icon.icns assets/icon.ico "dist/${NAME}/assets/"
           cp README.md "dist/${NAME}/"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
             cp dist/agy-notify.exe "dist/${NAME}/"
           else
             cp dist/agy-notify "dist/${NAME}/"
             chmod +x "dist/${NAME}/agy-notify"
           fi
-          if [[ "${{ runner.os }}" == "macOS" ]]; then
+
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
             mkdir -p "dist/${NAME}/bin"
             cp -R "bin/Antigravity Notifier.app" "dist/${NAME}/bin/"
             codesign --force --deep -s - "dist/${NAME}/bin/Antigravity Notifier.app"
           fi
+
           echo "NAME=${NAME}" >> "$GITHUB_ENV"
 
       - name: Smoke test packaged binary
         shell: bash
         run: |
           cd "dist/${NAME}"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
             ./agy-notify.exe --help
             ./agy-notify.exe doctor || true
           else
@@ -112,47 +152,179 @@ jobs:
       - name: Create archive and checksum
         shell: bash
         working-directory: dist
+        env:
+          PACKAGE_NAME: ${{ env.NAME }}
+          ARCHIVE_TYPE: ${{ matrix.archive }}
         run: |
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            7z a -tzip "${NAME}.zip" "${NAME}"
-            ARCHIVE="${NAME}.zip"
-          else
-            tar -czf "${NAME}.tar.gz" "${NAME}"
-            ARCHIVE="${NAME}.tar.gz"
-          fi
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
-          else
-            shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
-          fi
-          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+          python - <<'PY'
+          import hashlib
+          import os
+          import tarfile
+          import zipfile
 
-      - uses: actions/upload-artifact@v4
+          name = os.environ["PACKAGE_NAME"]
+          archive_type = os.environ["ARCHIVE_TYPE"]
+
+          if archive_type == "zip":
+              archive_name = f"{name}.zip"
+
+              with zipfile.ZipFile(archive_name, "w", zipfile.ZIP_DEFLATED) as archive:
+                  for root, _, files in os.walk(name):
+                      for file in files:
+                          path = os.path.join(root, file)
+                          archive.write(path, path)
+
+          else:
+              archive_name = f"{name}.tar.gz"
+
+              with tarfile.open(archive_name, "w:gz") as archive:
+                  archive.add(name, arcname=name)
+
+          with open(archive_name, "rb") as file:
+              checksum = hashlib.sha256(file.read()).hexdigest()
+
+          with open(f"{archive_name}.sha256", "w", encoding="utf-8") as file:
+              file.write(f"{checksum}  {archive_name}\n")
+
+          print(f"Created: {archive_name}")
+          print(f"SHA256: {checksum}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"ARCHIVE={archive_name}\n")
+          PY
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: |
             dist/${{ env.ARCHIVE }}
             dist/${{ env.ARCHIVE }}.sha256
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Platform Build Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Platform Build"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Platform | ${{ matrix.target }} |"
+            echo "| Runner | ${{ matrix.os }} |"
+            echo "| Result | ${{ job.status }} |"
+            echo "| Version | ${{ steps.version.outputs.value }} |"
+            echo ""
+            echo "Expected artifact:"
+            echo ""
+            echo "- agy-notify-${{ steps.version.outputs.value }}-${{ matrix.target }}.${{ matrix.archive }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release:
     name: Publish GitHub Release
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
+
     permissions:
       contents: write
+
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
 
-      - name: List assets
-        run: ls -la release-assets
+      - name: Verify release assets
+        shell: bash
+        run: |
+          ls -lah release-assets
 
-      - uses: softprops/action-gh-release@v2
+          test -n "$(find release-assets -type f \( -name '*.zip' -o -name '*.tar.gz' \))"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+      - name: Release Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Release Publishing"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Version | ${GITHUB_REF_NAME} |"
+            echo "| Result | ${{ job.status }} |"
+            echo "| Destination | GitHub Releases |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  summary:
+    name: Workflow Summary
+    needs: [test, build, release]
+    if: always()
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Generate final summary
+        shell: bash
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+        run: |
+          if [[ "$TEST_RESULT" == "success" && "$BUILD_RESULT" == "success" && ( "$RELEASE_RESULT" == "success" || "$RELEASE_RESULT" == "skipped" ) ]]; then
+            OVERALL="SUCCESS"
+          else
+            OVERALL="FAILURE"
+          fi
+
+          {
+            echo "# Workflow Summary"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Workflow | Release |"
+            echo "| Trigger | ${GITHUB_EVENT_NAME} |"
+            echo "| Ref | ${GITHUB_REF_NAME} |"
+            echo "| Commit | ${GITHUB_SHA} |"
+            echo "| Overall Status | ${OVERALL} |"
+            echo ""
+            echo "## Job Results"
+            echo ""
+            echo "| Job | Result |"
+            echo "|---|---|"
+            echo "| Unit Tests | ${TEST_RESULT} |"
+            echo "| Platform Builds | ${BUILD_RESULT} |"
+            echo "| GitHub Release | ${RELEASE_RESULT} |"
+            echo ""
+            echo "## Build Targets"
+            echo ""
+            echo "| Platform | Architecture | Package |"
+            echo "|---|---|---|"
+            echo "| macOS | ARM64 | tar.gz |"
+            echo "| Linux | x86_64 | tar.gz |"
+            echo "| Windows | x86_64 | zip |"
+            echo ""
+            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+              echo "## Distribution"
+              echo ""
+              echo "Version-tag build. Release publishing was triggered."
+            else
+              echo "## Distribution"
+              echo ""
+              echo "Build artifacts are available under the Actions run artifacts."
+              echo "No GitHub Release was published for this run."
+            fi
+            echo ""
+            echo "## Artifact Retention"
+            echo ""
+            echo "Build artifacts are retained for 30 days."
+          } >> "$GITHUB_STEP_SUMMARY"
