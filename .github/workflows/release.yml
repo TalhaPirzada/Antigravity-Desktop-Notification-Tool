@@ -19,12 +19,12 @@ permissions:
   contents: read
 
 env:
-  PYTHON_VERSION: "3.14"
+  PYTHON_VERSION: "3.11"
 
 jobs:
   test:
     name: Unit Tests
-    runs-on: ubuntu-26.04.1
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -58,17 +58,17 @@ jobs:
       matrix:
         include:
           - target: macos-arm64
-            os: macos-26
+            os: macos-latest
             icon: assets/icon.icns
             archive: tar.gz
 
           - target: linux-x86_64
-            os: ubuntu-26.04
+            os: ubuntu-22.04
             icon: assets/icon.png
             archive: tar.gz
 
           - target: windows-x86_64
-            os: windows-2025
+            os: windows-latest
             icon: assets/icon.ico
             archive: zip
 
