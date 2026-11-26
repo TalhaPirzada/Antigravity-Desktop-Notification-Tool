@@ -88,9 +88,9 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             VERSION="${GITHUB_REF_NAME}"
           elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            VERSION="${{ github.event.inputs.version || 'dev' }}"
+            VERSION="${{ github.event.inputs.version || 'latest' }}"
           else
-            VERSION="dev"
+            VERSION="latest"
           fi
 
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -225,13 +225,25 @@ jobs:
   release:
     name: Publish GitHub Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-22.04
 
     permissions:
       contents: write
 
     steps:
+      - name: Resolve release tag
+        id: release_tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${{ github.event.inputs.version }}" ]]; then
+            TAG="${{ github.event.inputs.version }}"
+          else
+            TAG="latest"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
       - name: Download platform artifacts
         uses: actions/download-artifact@v4
         with:
@@ -248,6 +260,8 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: Release ${{ steps.release_tag.outputs.tag }}
           files: release-assets/*
           generate_release_notes: true
           fail_on_unmatched_files: true
@@ -261,7 +275,7 @@ jobs:
             echo ""
             echo "| Property | Value |"
             echo "|---|---|"
-            echo "| Version | ${GITHUB_REF_NAME} |"
+            echo "| Version | ${{ steps.release_tag.outputs.tag }} |"
             echo "| Result | ${{ job.status }} |"
             echo "| Destination | GitHub Releases |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -313,16 +327,9 @@ jobs:
             echo "| Linux | x86_64 | tar.gz |"
             echo "| Windows | x86_64 | zip |"
             echo ""
-            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-              echo "## Distribution"
-              echo ""
-              echo "Version-tag build. Release publishing was triggered."
-            else
-              echo "## Distribution"
-              echo ""
-              echo "Build artifacts are available under the Actions run artifacts."
-              echo "No GitHub Release was published for this run."
-            fi
+            echo "## Distribution"
+            echo ""
+            echo "GitHub Release published with latest artifacts and binaries."
             echo ""
             echo "## Artifact Retention"
             echo ""
